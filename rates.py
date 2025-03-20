@@ -146,6 +146,13 @@ def get_cryptocompare_price(ticker):
 def get_binance_price(ticker):
     ticker = ticker.upper()
 
+    # Blacklist for tokens delisted from Binance
+    binance_blacklist = ["XMR"]
+
+    # Check if ticker is blacklisted for Binance
+    if ticker in binance_blacklist:
+        return None, f"Token {ticker} is delisted or not available on Binance"
+
     try:
         # First get the current price
         price_req = sess.get(
