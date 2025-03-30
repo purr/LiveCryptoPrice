@@ -1,7 +1,10 @@
 """Configuration settings for the Live Crypto Price Bot."""
 
+# Data directory
+DATA_DIR = "data"
+
 # Update interval in seconds
-UPDATE_INTERVAL = 60
+UPDATE_INTERVAL = 120
 
 # Channel configurations
 CHANNELS = [
@@ -13,7 +16,7 @@ CHANNELS = [
     {"channel_id": "-1002646484589", "tickers": ["SOL"]},
     {"channel_id": "-1002570233511", "tickers": ["BNB"]},
     {
-        "channel_id": "-1002550449265",
+        "channel_id": "-1002591839246",
         "tickers": [
             "BTC",
             "TON",

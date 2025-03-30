@@ -1,8 +1,21 @@
 import os
 import json
+import time
 import asyncio
 import pathlib
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+"""
+Live Crypto Price Bot
+Version: 1.3.0
+- Added concurrent processing of channels using async tasks
+- Improved performance with parallel ticker processing
+- Optimized code structure by reducing redundancy
+- Added tracking for unsupported exchange-ticker pairs
+- Implemented skipping of known unsupported pairs for better performance
+- Reverted to sequential channel updates for stability
+- Enhanced cache usage for better performance
+"""
 
 from dotenv import load_dotenv
 from aiogram import Bot
@@ -14,7 +27,6 @@ from aiogram.exceptions import (
 )
 from aiogram.client.default import DefaultBotProperties
 
-from rates import format_price, get_crypto_price, format_percent_change
 from config import (
     SORTING,
     CHANNELS,
@@ -22,14 +34,24 @@ from config import (
     UPDATE_INTERVAL,
     SHOW_INDIVIDUAL_SOURCES,
 )
-from logger import logger
+from utils.rates import format_price, get_cached_price, get_crypto_price
+from utils.logger import logger
 
-# Load price history or create it if it doesn't exist
-PRICE_HISTORY_FILE = "price_history.json"
+# Data directory setup
+DATA_DIR = "data"
+PRICE_HISTORY_FILE = os.path.join(DATA_DIR, "price_history.json")
+
+
+def ensure_data_directory():
+    """Create data directory if it doesn't exist."""
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+        logger.info(f"Created data directory: {DATA_DIR}")
 
 
 def load_price_history():
     """Load price history from JSON file or create a new one if it doesn't exist."""
+    ensure_data_directory()
     history_path = pathlib.Path(PRICE_HISTORY_FILE)
     if history_path.exists():
         try:
@@ -40,15 +62,16 @@ def load_price_history():
             return {}
     else:
         logger.info("Price history file not found, creating new history.")
+        save_price_history({})  # Create empty file
         return {}
 
 
 def save_price_history(history):
     """Save price history to JSON file."""
+    ensure_data_directory()
     try:
         with open(PRICE_HISTORY_FILE, "w") as history_file:
             json.dump(history, history_file, indent=2)
-        logger.debug("Price history saved successfully")
     except Exception as e:
         logger.error(f"Error saving price history: {e}")
 
@@ -101,16 +124,44 @@ async def check_channel_access(channel_id: str) -> bool:
         return False
 
 
-async def create_price_message(ticker: str) -> Optional[str]:
-    """Create a message with the price information for a ticker."""
-    logger.debug(f"Creating price info for {ticker}")
+async def fetch_price_data(ticker: str) -> Optional[Dict[str, Any]]:
+    """Asynchronously fetch price data for a ticker, using cache when available."""
     try:
-        data = get_crypto_price(ticker)
-        logger.debug(f"Got data for {ticker}")
+        # First, try to get cached data
+        cached_data = get_cached_price(ticker)
+        if cached_data:
+            logger.debug(f"Using cached data for {ticker}")
+            return cached_data
 
+        # If no cached data is available, fetch from external APIs
+        logger.debug(f"No cached data for {ticker}, fetching from APIs")
+        return await asyncio.to_thread(get_crypto_price, ticker)
+    except Exception as e:
+        logger.error(f"Error fetching price for {ticker}: {e}")
+        return None
+
+
+def format_market_change(change):
+    """Format market change with up/down arrows as requested."""
+    if change is None:
+        return "N/A"
+
+    # Format with 2 decimal places and proper sign
+    if change > 0:
+        return f"[▲ +{change:.2f}%]"
+    elif change < 0:
+        return f"[▼ {change:.2f}%]"
+    else:
+        return f"[— {change:.2f}%]"
+
+
+async def process_ticker_data(ticker: str) -> Optional[Dict[str, Any]]:
+    """Process data for a single ticker, to be used concurrently."""
+    try:
+        data = await fetch_price_data(ticker)
         if not data or data.get("average_price") is None:
             logger.warning(f"No price data for {ticker}")
-            return f"❌ Unable to fetch {ticker} price from any source"
+            return None
 
         # Get current price
         current_price = data["average_price"]
@@ -118,66 +169,41 @@ async def create_price_message(ticker: str) -> Optional[str]:
         # Get 24h change percentage and format it
         change_24h = data.get("average_change_24h")
         change_24h_str = (
-            format_percent_change(change_24h) if change_24h is not None else "N/A"
+            format_market_change(change_24h) if change_24h is not None else "N/A"
         )
 
-        # Debug all source changes
-        logger.debug(f"24h changes for {ticker}:")
-        for source, source_data in data["sources"].items():
-            change = source_data.get("change_24h")
-            if change is not None:
-                logger.debug(f"  - {source}: {format_percent_change(change)}")
-            else:
-                logger.debug(f"  - {source}: N/A")
-
-        if change_24h is not None:
-            logger.debug(
-                f"Average 24h change for {ticker}: {format_percent_change(change_24h)}"
-            )
-
         # Get price change indicator based on last recorded price
-        price_indicator = ""
+        price_indicator = "—"
+        price_changed = "none"
+
         if ticker in price_history:
             prev_price = price_history[ticker]
             if current_price > prev_price:
-                price_indicator = "📈︎"  # Green up arrow for price increase
+                price_indicator = "📈"  # Green up arrow for price increase
+                price_changed = "up"
             elif current_price < prev_price:
-                price_indicator = "📉︎"  # Red down arrow for price decrease
-            else:
-                price_indicator = "🗠︎"  # White horizontal arrow for no change
+                price_indicator = "📉"  # Red down arrow for price decrease
+                price_changed = "down"
 
         # Update price history for next comparison
         price_history[ticker] = current_price
         save_price_history(price_history)
 
-        message_parts = []
-
-        # Main header with ticker and price change indicator
-        message_parts.append(
-            f"{price_indicator} <code>{format_price(current_price)}</code> [{change_24h_str}]"
-        )
-
-        # Add 10 spaces dynamically
-        message_parts.append(f"{' ' * 25}")
-
-        # Individual sources if configured to show them
-        if SHOW_INDIVIDUAL_SOURCES and data["sources"]:
-            message_parts.append("<b>Sources:</b>")
-            for source, source_data in data["sources"].items():
-                price = source_data["price"]
-                change = source_data.get("change_24h")
-                change_str = (
-                    format_percent_change(change) if change is not None else "N/A"
-                )
-                message_parts.append(
-                    f"• {source}: <code>{format_price(price)}</code> [{change_str}]"
-                )
-
-        final_message = "\n".join(message_parts)
-        logger.debug(f"Prepared {ticker} message")
-        return final_message
+        # Return ticker data for sorting and formatting
+        return {
+            "ticker": ticker,
+            "length": len(ticker),
+            "price": current_price,
+            "price_str": format_price(current_price),
+            "change_str": change_24h_str,
+            "price_indicator": price_indicator,
+            "price_changed": price_changed,
+            "raw_data": data,
+            "active_sources": data.get("active_sources", 0),
+            "skipped_sources": data.get("skipped_sources", 0),
+        }
     except Exception as e:
-        logger.error(f"Error creating message for {ticker}: {e}")
+        logger.error(f"Error processing ticker {ticker}: {e}")
         return None
 
 
@@ -185,50 +211,14 @@ async def create_consolidated_price_message(tickers: List[str]) -> Optional[str]
     """Create a single message with price information for multiple tickers."""
     logger.debug(f"Creating consolidated price info for {tickers}")
     try:
+        # Process each ticker sequentially instead of concurrently
         ticker_data = []
-
         for ticker in tickers:
-            data = get_crypto_price(ticker)
-            logger.debug(f"Got data for {ticker}")
-
-            if not data or data.get("average_price") is None:
-                logger.warning(f"No price data for {ticker}")
-                continue
-
-            current_price = data["average_price"]
-            change_24h = data.get("average_change_24h")
-            change_24h_str = (
-                format_percent_change(change_24h) if change_24h is not None else "N/A"
-            )
-
-            # Get price change indicator based on last recorded price
-            price_indicator = ""
-            if ticker in price_history:
-                prev_price = price_history[ticker]
-                if current_price > prev_price:
-                    price_indicator = "📈︎"  # Green up arrow for price increase
-                elif current_price < prev_price:
-                    price_indicator = "📉︎"  # Red down arrow for price decrease
-                else:
-                    price_indicator = (
-                        "🔁🔄🔄🗠🔄"  # White horizontal arrow for no change
-                    )
-
-            # Update price history for next comparison
-            price_history[ticker] = current_price
-            save_price_history(price_history)
-
-            # Store ticker data for sorting
-            ticker_data.append(
-                {
-                    "ticker": ticker,
-                    "length": len(ticker),
-                    "price": current_price,
-                    "indicator": price_indicator,
-                    "price_str": format_price(current_price),
-                    "change_str": change_24h_str,
-                }
-            )
+            data = await process_ticker_data(ticker)
+            if data:
+                ticker_data.append(data)
+            # Small delay between ticker requests to avoid overwhelming APIs
+            await asyncio.sleep(0.5)
 
         if not ticker_data:
             return "❌ Unable to fetch prices for any tickers"
@@ -263,7 +253,7 @@ async def create_consolidated_price_message(tickers: List[str]) -> Optional[str]
 
         # Format messages
         message_parts = [
-            f"{item['ticker']} {item['indicator']} <code>{item['price_str']}</code> [{item['change_str']}]"
+            f"${item['ticker']} <code>{item['price_str']}</code> {item['change_str']}"
             for item in ticker_data
         ]
 
@@ -277,9 +267,54 @@ async def send_update_to_channel(channel_id: str, tickers: List[str]) -> bool:
     """Send crypto price updates to a specific channel."""
     logger.debug(f"Sending updates for {tickers} to {channel_id}")
     try:
+        message = None
         if len(tickers) == 1:
-            message = await create_price_message(tickers[0])
+            # For single ticker, create detailed message
+            ticker = tickers[0]
+            ticker_data = await process_ticker_data(ticker)
+            if ticker_data:
+                message_parts = []
+                # Get price change indicator based on last recorded price
+                price_indicator = ticker_data["price_indicator"]
+
+                # Main header with ticker and price change indicator
+                message_parts.append(
+                    f"{price_indicator} <code>{ticker_data['price_str']}</code> {ticker_data['change_str']}"
+                )
+
+                # Add spacing
+                message_parts.append(f"{' ' * 25}")
+
+                # Add source count information
+                active = ticker_data.get("active_sources", 0)
+                skipped = ticker_data.get("skipped_sources", 0)
+
+                logger.debug(f"Used sources: {active}")
+                logger.debug(f"Skipped sources: {skipped}")
+
+                if (
+                    SHOW_INDIVIDUAL_SOURCES
+                    and ticker_data["raw_data"]
+                    and ticker_data["raw_data"].get("sources")
+                ):
+                    message_parts.append(f"<b>Sources:</b>")
+                    for source, source_data in ticker_data["raw_data"][
+                        "sources"
+                    ].items():
+                        price = source_data["price"]
+                        change = source_data.get("change_24h")
+                        change_str = (
+                            format_market_change(change)
+                            if change is not None
+                            else "N/A"
+                        )
+                        message_parts.append(
+                            f"• {source}: <code>{format_price(price)}</code> {change_str}"
+                        )
+
+                message = "\n".join(message_parts)
         else:
+            # For multiple tickers, use consolidated message
             message = await create_consolidated_price_message(tickers)
 
         if message:
@@ -306,7 +341,7 @@ async def send_update_to_channel(channel_id: str, tickers: List[str]) -> bool:
 
 
 async def update_channels() -> None:
-    """Send updates to all configured channels."""
+    """Send updates to configured channels sequentially."""
     logger.info("Starting channel updates...")
 
     for channel_config in CHANNELS:
@@ -317,19 +352,56 @@ async def update_channels() -> None:
             logger.warning("Channel ID not specified in config")
             continue
 
-        # Check if bot has access to the channel
-        logger.debug(f"Checking access to channel {channel_id}")
-        has_access = await check_channel_access(channel_id)
-        if not has_access:
-            logger.warning(f"No access to channel {channel_id}")
-            continue
+        # Process each channel sequentially
+        try:
+            # Check if bot has access to the channel
+            logger.debug(f"Checking access to channel {channel_id}")
+            has_access = await check_channel_access(channel_id)
+            if not has_access:
+                logger.warning(f"No access to channel {channel_id}")
+                continue
 
-        logger.info(f"Updating channel {channel_id} with {', '.join(tickers)}")
-        success = await send_update_to_channel(channel_id, tickers)
-        if not success:
-            logger.warning(f"Failed to update channel {channel_id}")
+            logger.info(f"Updating channel {channel_id} with {', '.join(tickers)}")
+            success = await send_update_to_channel(channel_id, tickers)
+            if not success:
+                logger.warning(f"Failed to update channel {channel_id}")
+
+            # Add a small delay between channel updates
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Error updating channel {channel_id}: {e}")
 
     logger.info("All channel updates completed")
+
+
+async def display_status():
+    """Display cache and unsupported pairs status information."""
+    try:
+        # Get cache information
+        from utils.rates import price_cache, unsupported_pairs
+
+        # Count cached items and calculate average age
+        cache_count = len(price_cache)
+        cache_age = 0
+        current_time = time.time()
+
+        if cache_count > 0:
+            total_age = sum(
+                current_time - timestamp for timestamp, _ in price_cache.values()
+            )
+            cache_age = total_age / cache_count
+
+        # Count unsupported pairs
+        unsupported_count = sum(len(pairs) for pairs in unsupported_pairs.values())
+        exchange_count = len(unsupported_pairs)
+
+        # Display information
+        logger.info(f"Cache status: {cache_count} items, avg age: {cache_age:.1f}s")
+        logger.info(
+            f"Unsupported pairs: {unsupported_count} across {exchange_count} exchanges"
+        )
+    except Exception as e:
+        logger.error(f"Error displaying status: {e}")
 
 
 async def main() -> None:
@@ -338,32 +410,37 @@ async def main() -> None:
     logger.info("Starting crypto price update bot")
     logger.info("=" * 40)
 
-    print("=" * 40)
-    print("CRYPTOCURRENCY PRICE UPDATE BOT")
-    print("=" * 40)
-    print("Bot is starting...")
+    # Ensure data directory exists
+    ensure_data_directory()
 
     # Get bot info
     bot_info = await bot.get_me()
     logger.info(f"Bot: @{bot_info.username} (ID: {bot_info.id})")
-    print(f"Bot: @{bot_info.username} (ID: {bot_info.id})")
 
-    print(f"Update interval: {UPDATE_INTERVAL} seconds")
-    print(f"Configured channels: {len(CHANNELS)}")
-    print("Bot is running. Press Ctrl+C to stop.")
-    print("=" * 40)
+    update_count = 0
 
     while True:
         try:
+            # Add separator line between update cycles
+            logger.info("-" * 40)
+
+            # Display status information
+            await display_status()
+
+            start_time = time.time()
             await update_channels()
+            end_time = time.time()
+
+            update_count += 1
+            duration = end_time - start_time
+
+            logger.info(f"Update #{update_count} completed in {duration:.2f} seconds")
             logger.info(f"Next update in {UPDATE_INTERVAL} seconds")
-            print(f"Updates sent! Next update in {UPDATE_INTERVAL} seconds...")
+
             await asyncio.sleep(UPDATE_INTERVAL)
         except Exception as e:
             logger.error(f"Error: {e}")
             logger.info(f"Retrying in {RETRY_INTERVAL} seconds")
-            print(f"Error occurred: {e}")
-            print(f"Retrying in {RETRY_INTERVAL} seconds...")
             await asyncio.sleep(RETRY_INTERVAL)
 
 
@@ -374,10 +451,7 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
-        print("\nBot stopped by user")
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
-        print(f"\nFatal error: {e}")
     finally:
         loop.close()
-        print("Bot stopped. Goodbye!")
