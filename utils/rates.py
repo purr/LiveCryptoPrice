@@ -5,7 +5,9 @@ from typing import Any, Set, Dict, Tuple, Optional
 
 """
 Cryptocurrency Rates Module
-Version: 1.3.0
+Version: 1.4.0
+- Added manual blacklisting mechanism for exchange-ticker pairs
+- Added specific blacklist for Monero (XMR) on Binance
 - Added tracking for unsupported exchange-ticker pairs
 - Implemented caching to avoid retrying failed pairs
 - Optimized API requests by skipping known unsupported pairs
@@ -25,6 +27,8 @@ __all__ = [
     "get_cached_price",
     "price_cache",
     "unsupported_pairs",
+    "blacklist_pair",
+    "unblacklist_pair",
 ]
 
 # Get the request manager instance
@@ -135,6 +139,30 @@ def load_unsupported_pairs():
         save_unsupported_pairs()
 
 
+# Initialize manual blacklist entries
+def initialize_manual_blacklist():
+    """
+    Initialize manual blacklist entries for specific exchange-ticker pairs.
+    This ensures certain pairs are always marked as unsupported, even if they
+    might work technically, for regulatory or other reasons.
+
+    Version: 1.0.0
+    - Added initial implementation
+    - Blacklisted Monero (XMR) on Binance
+    """
+    # Cryptocurrencies to blacklist on specific exchanges
+    manual_blacklist = {
+        "Binance": ["XMR"],  # Monero is blacklisted on Binance
+    }
+
+    # Apply the manual blacklist
+    for exchange, tickers in manual_blacklist.items():
+        for ticker in tickers:
+            if not is_pair_unsupported(exchange, ticker):
+                mark_pair_as_unsupported(exchange, ticker)
+                logger.info(f"Manually blacklisted {ticker} on {exchange}")
+
+
 # Last save timestamp to avoid excessive disk I/O
 _last_unsupported_save = 0
 
@@ -186,10 +214,61 @@ def mark_pair_as_unsupported(exchange: str, ticker: str):
         save_unsupported_pairs()
 
 
+def blacklist_pair(exchange: str, ticker: str) -> bool:
+    """
+    Blacklist a specific ticker from an exchange.
+    This is a programmatic way to manually mark pairs as unsupported.
+
+    Args:
+        exchange: The exchange name to blacklist from
+        ticker: The ticker symbol to blacklist
+
+    Returns:
+        bool: True if blacklisted successfully, False if already blacklisted
+    """
+    ticker = ticker.upper()
+
+    if is_pair_unsupported(exchange, ticker):
+        logger.debug(f"{ticker} is already blacklisted on {exchange}")
+        return False
+
+    mark_pair_as_unsupported(exchange, ticker)
+    logger.info(f"Manually blacklisted {ticker} on {exchange}")
+    return True
+
+
+def unblacklist_pair(exchange: str, ticker: str) -> bool:
+    """
+    Remove a ticker from the blacklist for an exchange.
+    This allows previously blacklisted pairs to be queried again.
+
+    Args:
+        exchange: The exchange name
+        ticker: The ticker symbol to unblacklist
+
+    Returns:
+        bool: True if unblacklisted successfully, False if not blacklisted
+    """
+    ticker = ticker.upper()
+
+    if not is_pair_unsupported(exchange, ticker):
+        logger.debug(f"{ticker} is not blacklisted on {exchange}")
+        return False
+
+    if exchange in unsupported_pairs and ticker in unsupported_pairs[exchange]:
+        unsupported_pairs[exchange].remove(ticker)
+        logger.info(f"Removed {ticker} from blacklist on {exchange}")
+        save_unsupported_pairs()
+        return True
+
+    return False
+
+
 # Load cache and unsupported pairs on module import
 try:
     load_markets_cache()
     load_unsupported_pairs()
+    initialize_manual_blacklist()  # Apply manual blacklist after loading from file
 except Exception as e:
     logger.error(f"Failed to load cache data: {e}")
 
