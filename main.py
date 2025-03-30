@@ -144,7 +144,7 @@ async def fetch_price_data(ticker: str) -> Optional[Dict[str, Any]]:
 def format_market_change(change):
     """Format market change with up/down arrows as requested."""
     if change is None:
-        return "N/A"
+        return f"[N/A]"
 
     # Format with 2 decimal places and proper sign
     if change > 0:
