@@ -1,31 +1,33 @@
-import sys
-import json
+import time
+from typing import Any, Dict, Tuple, Optional
 
 import httpx
-from loguru import logger
 
-# Configure Loguru with colors
-logger.remove()  # Remove default handler
-logger.configure(
-    handlers=[
-        {
-            "sink": sys.stderr,
-            "format": "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-            "colorize": True,
-        }
-    ]
-)
-
-# Load configuration
-with open("config.json", "r") as config_file:
-    config = json.load(config_file)
-    logger.debug(f"Loaded rates configuration: {config}")
+from config import TIMEOUT, CACHE_DURATION
+from logger import logger
 
 # Initialize HTTP client
-sess = httpx.Client(timeout=config.get("timeout", 10))
-logger.debug(
-    f"Initialized HTTP client with timeout of {config.get('timeout', 10)} seconds"
-)
+sess = httpx.Client(timeout=TIMEOUT)
+logger.debug(f"Initialized HTTP client with timeout of {TIMEOUT} seconds")
+
+# Cache configuration
+price_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # {ticker: (timestamp, data)}
+
+
+def get_cached_price(ticker: str) -> Optional[Dict[str, Any]]:
+    """Get cached price data if it exists and is not expired."""
+    if ticker in price_cache:
+        timestamp, data = price_cache[ticker]
+        if time.time() - timestamp < CACHE_DURATION:
+            logger.debug(f"Using cached data for {ticker}")
+            return data
+    return None
+
+
+def set_cached_price(ticker: str, data: Dict[str, Any]) -> None:
+    """Cache price data with current timestamp."""
+    price_cache[ticker] = (time.time(), data)
+    logger.debug(f"Cached new data for {ticker}")
 
 
 # CoinGecko API - Free public API
@@ -86,6 +88,13 @@ def get_coingecko_price(ticker):
         "DOT": "polkadot",
         "AVAX": "avalanche-2",
         "LINK": "chainlink",
+        "LTC": "litecoin",
+        "VET": "vechain",
+        "TRX": "tron",
+        "XMR": "monero",
+        "BNB": "binancecoin",
+        "NOT": "not-financial-advice",  # New token
+        "MAJOR": "major-protocol",  # New token
     }
 
     ticker = ticker.upper()
@@ -185,6 +194,36 @@ def get_binance_price(ticker):
         return None, f"Exception: {str(e)}"
 
 
+# Function to get price for any ticker from Gate.io
+def get_gateio_price(ticker):
+    ticker = ticker.upper()
+
+    try:
+        # Get ticker info
+        req = sess.get(
+            f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={ticker}_USDT"
+        )
+
+        if req.status_code == 200:
+            data = req.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                ticker_data = data[0]
+                price = float(ticker_data["last"])
+                # Calculate 24h change
+                change_24h = None
+                if "high_24h" in ticker_data and "low_24h" in ticker_data:
+                    open_24h = float(ticker_data.get("open_24h", 0))
+                    if open_24h > 0:
+                        change_24h = ((price - open_24h) / open_24h) * 100
+
+                result = {"price": price, "change_24h": change_24h}
+                return result, None
+            return None, "No data found in response"
+        return None, f"Error {req.status_code}: {req.text}"
+    except Exception as e:
+        return None, f"Exception: {str(e)}"
+
+
 # Function to get price for any ticker from Kraken
 def get_kraken_price(ticker):
     ticker = ticker.upper()
@@ -201,8 +240,13 @@ def get_kraken_price(ticker):
         "DOT": "DOT",
         "AVAX": "AVAX",
         "LINK": "LINK",
-        "XMR": "XMR",  # Fixed, Kraken uses XMR not XXMR
+        "XMR": "XMR",
         "BNB": "BNB",
+        "LTC": "LTC",
+        "VET": "VET",
+        "TRX": "TRX",
+        "NOT": "NOT",
+        "MAJOR": "MAJOR",
     }
 
     # Find the Kraken asset code
@@ -215,6 +259,7 @@ def get_kraken_price(ticker):
 
         # Build an array of possible pair formats to try
         pair_formats = [
+            f"{asset_code}/USD",  # Modern format (BNB/USD)
             f"{asset_code}USD",  # Standard format (XMRUSD)
             f"{asset_code}USDT",  # USDT pair (XMRUSDT)
             f"X{asset_code}ZUSD",  # With prefixes (XXMRZUSD)
@@ -224,7 +269,7 @@ def get_kraken_price(ticker):
 
         # Special case for BTC
         if ticker == "BTC":
-            pair_formats = ["XXBTZUSD", "XBTUSD", "XBTZUSD"] + pair_formats
+            pair_formats = ["XXBTZUSD", "XBTUSD", "XBTZUSD", "XBT/USD"] + pair_formats
 
         # Try each pair format
         for pair_format in pair_formats:
@@ -398,6 +443,11 @@ def format_percent_change(change):
 def get_crypto_price(ticker):
     logger.info(f"Fetching {ticker} prices...")
 
+    # Check cache first
+    cached_data = get_cached_price(ticker)
+    if cached_data is not None:
+        return cached_data
+
     # Store prices for calculating average
     prices = []
     change_24h_values = []
@@ -420,6 +470,23 @@ def get_crypto_price(ticker):
         )
     else:
         logger.warning(f"CoinGecko does not have ticker {ticker} - {error}")
+
+    # Gate.io
+    result, error = get_gateio_price(ticker)
+    if result is not None:
+        prices.append(result["price"])
+        if result["change_24h"] is not None:
+            change_24h_values.append(result["change_24h"])
+        active_sources += 1
+        source_data["Gate.io"] = {
+            "price": result["price"],
+            "change_24h": result["change_24h"],
+        }
+        logger.debug(
+            f"Gate.io: {format_price(result['price'])} ({format_percent_change(result['change_24h'])})"
+        )
+    else:
+        logger.warning(f"Gate.io does not have ticker {ticker} - {error}")
 
     # CryptoCompare
     result, error = get_cryptocompare_price(ticker)
@@ -516,5 +583,8 @@ def get_crypto_price(ticker):
         result["average_price"] = None
         result["average_change_24h"] = None
         logger.warning(f"Unable to fetch {ticker} price from any source")
+
+    # Cache the result
+    set_cached_price(ticker, result)
 
     return result

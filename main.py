@@ -1,12 +1,10 @@
 import os
-import sys
 import json
 import asyncio
 import pathlib
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from loguru import logger
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import (
@@ -17,18 +15,14 @@ from aiogram.exceptions import (
 from aiogram.client.default import DefaultBotProperties
 
 from rates import format_price, get_crypto_price, format_percent_change
-
-# Configure Loguru with colors
-logger.remove()  # Remove default handler
-logger.configure(
-    handlers=[
-        {
-            "sink": sys.stderr,
-            "format": "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-            "colorize": True,
-        }
-    ]
+from config import (
+    SORTING,
+    CHANNELS,
+    RETRY_INTERVAL,
+    UPDATE_INTERVAL,
+    SHOW_INDIVIDUAL_SOURCES,
 )
+from logger import logger
 
 # Load price history or create it if it doesn't exist
 PRICE_HISTORY_FILE = "price_history.json"
@@ -71,10 +65,7 @@ if not BOT_TOKEN:
 # Initialize bot with new syntax for aiogram 3.7.0+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-# Load configuration
-with open("config.json", "r") as config_file:
-    config = json.load(config_file)
-    logger.debug(f"Loaded configuration: {config}")
+logger.debug(f"Loaded configuration with update interval: {UPDATE_INTERVAL}")
 
 
 async def check_channel_access(channel_id: str) -> bool:
@@ -170,7 +161,7 @@ async def create_price_message(ticker: str) -> Optional[str]:
         message_parts.append(f"{' ' * 25}")
 
         # Individual sources if configured to show them
-        if config.get("show_individual_sources", True) and data["sources"]:
+        if SHOW_INDIVIDUAL_SOURCES and data["sources"]:
             message_parts.append("<b>Sources:</b>")
             for source, source_data in data["sources"].items():
                 price = source_data["price"]
@@ -190,19 +181,115 @@ async def create_price_message(ticker: str) -> Optional[str]:
         return None
 
 
+async def create_consolidated_price_message(tickers: List[str]) -> Optional[str]:
+    """Create a single message with price information for multiple tickers."""
+    logger.debug(f"Creating consolidated price info for {tickers}")
+    try:
+        ticker_data = []
+
+        for ticker in tickers:
+            data = get_crypto_price(ticker)
+            logger.debug(f"Got data for {ticker}")
+
+            if not data or data.get("average_price") is None:
+                logger.warning(f"No price data for {ticker}")
+                continue
+
+            current_price = data["average_price"]
+            change_24h = data.get("average_change_24h")
+            change_24h_str = (
+                format_percent_change(change_24h) if change_24h is not None else "N/A"
+            )
+
+            # Get price change indicator based on last recorded price
+            price_indicator = ""
+            if ticker in price_history:
+                prev_price = price_history[ticker]
+                if current_price > prev_price:
+                    price_indicator = "📈︎"  # Green up arrow for price increase
+                elif current_price < prev_price:
+                    price_indicator = "📉︎"  # Red down arrow for price decrease
+                else:
+                    price_indicator = (
+                        "🔁🔄🔄🗠🔄"  # White horizontal arrow for no change
+                    )
+
+            # Update price history for next comparison
+            price_history[ticker] = current_price
+            save_price_history(price_history)
+
+            # Store ticker data for sorting
+            ticker_data.append(
+                {
+                    "ticker": ticker,
+                    "length": len(ticker),
+                    "price": current_price,
+                    "indicator": price_indicator,
+                    "price_str": format_price(current_price),
+                    "change_str": change_24h_str,
+                }
+            )
+
+        if not ticker_data:
+            return "❌ Unable to fetch prices for any tickers"
+
+        # Apply sorting based on configuration
+        if SORTING.get("enabled", True):
+            primary_key = SORTING.get("primary_key", "length")
+            secondary_key = SORTING.get("secondary_key", "price")
+            order = SORTING.get("order", {"length": "asc", "price": "desc"})
+
+            def sort_key(x):
+                primary_value = x[primary_key]
+                secondary_value = x[secondary_key]
+
+                # Apply ordering direction
+                if order.get(primary_key) == "desc":
+                    primary_value = (
+                        -primary_value
+                        if isinstance(primary_value, (int, float))
+                        else primary_value
+                    )
+                if order.get(secondary_key) == "desc":
+                    secondary_value = (
+                        -secondary_value
+                        if isinstance(secondary_value, (int, float))
+                        else secondary_value
+                    )
+
+                return (primary_value, secondary_value)
+
+            ticker_data.sort(key=sort_key)
+
+        # Format messages
+        message_parts = [
+            f"{item['ticker']} {item['indicator']} <code>{item['price_str']}</code> [{item['change_str']}]"
+            for item in ticker_data
+        ]
+
+        return "\n".join(message_parts)
+    except Exception as e:
+        logger.error(f"Error creating consolidated message: {e}")
+        return None
+
+
 async def send_update_to_channel(channel_id: str, tickers: List[str]) -> bool:
     """Send crypto price updates to a specific channel."""
     logger.debug(f"Sending updates for {tickers} to {channel_id}")
     try:
-        for ticker in tickers:
-            message = await create_price_message(ticker)
-            if message:
-                logger.debug(f"Sending {ticker} update to {channel_id}")
-                await bot.send_message(channel_id, message)
-                logger.debug(f"Sent {ticker} update to {channel_id}")
-                # Small delay to avoid hitting rate limits
-                await asyncio.sleep(0.5)
-        return True
+        if len(tickers) == 1:
+            message = await create_price_message(tickers[0])
+        else:
+            message = await create_consolidated_price_message(tickers)
+
+        if message:
+            logger.debug(f"Sending update to {channel_id}")
+            await bot.send_message(channel_id, message)
+            logger.debug(f"Sent update to {channel_id}")
+            # Small delay to avoid hitting rate limits
+            await asyncio.sleep(0.5)
+            return True
+        return False
     except TelegramRetryAfter as e:
         logger.warning(f"Rate limited. Retry after {e.retry_after}s")
         await asyncio.sleep(e.retry_after)
@@ -222,7 +309,7 @@ async def update_channels() -> None:
     """Send updates to all configured channels."""
     logger.info("Starting channel updates...")
 
-    for channel_config in config.get("channels", []):
+    for channel_config in CHANNELS:
         channel_id = channel_config.get("channel_id")
         tickers = channel_config.get("tickers", [])
 
@@ -261,26 +348,23 @@ async def main() -> None:
     logger.info(f"Bot: @{bot_info.username} (ID: {bot_info.id})")
     print(f"Bot: @{bot_info.username} (ID: {bot_info.id})")
 
-    update_interval = config.get("update_interval", 300)  # Default: 5 minutes
-    retry_interval = config.get("retry_interval", 60)  # Default: 1 minute
-
-    print(f"Update interval: {update_interval} seconds")
-    print(f"Configured channels: {len(config.get('channels', []))}")
+    print(f"Update interval: {UPDATE_INTERVAL} seconds")
+    print(f"Configured channels: {len(CHANNELS)}")
     print("Bot is running. Press Ctrl+C to stop.")
     print("=" * 40)
 
     while True:
         try:
             await update_channels()
-            logger.info(f"Next update in {update_interval} seconds")
-            print(f"Updates sent! Next update in {update_interval} seconds...")
-            await asyncio.sleep(update_interval)
+            logger.info(f"Next update in {UPDATE_INTERVAL} seconds")
+            print(f"Updates sent! Next update in {UPDATE_INTERVAL} seconds...")
+            await asyncio.sleep(UPDATE_INTERVAL)
         except Exception as e:
             logger.error(f"Error: {e}")
-            logger.info(f"Retrying in {retry_interval} seconds")
+            logger.info(f"Retrying in {RETRY_INTERVAL} seconds")
             print(f"Error occurred: {e}")
-            print(f"Retrying in {retry_interval} seconds...")
-            await asyncio.sleep(retry_interval)
+            print(f"Retrying in {RETRY_INTERVAL} seconds...")
+            await asyncio.sleep(RETRY_INTERVAL)
 
 
 if __name__ == "__main__":
