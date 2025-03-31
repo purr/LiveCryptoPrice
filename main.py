@@ -283,7 +283,7 @@ async def send_update_to_channel(channel_id: str, tickers: List[str]) -> bool:
                 )
 
                 # Add spacing
-                message_parts.append(f"{' ' * 25}")
+                message_parts.append(f"{' ' * 60}")
 
                 # Add source count information
                 active = ticker_data.get("active_sources", 0)
@@ -298,9 +298,26 @@ async def send_update_to_channel(channel_id: str, tickers: List[str]) -> bool:
                     and ticker_data["raw_data"].get("sources")
                 ):
                     message_parts.append(f"<b>Sources:</b>")
-                    for source, source_data in ticker_data["raw_data"][
-                        "sources"
-                    ].items():
+
+                    # Get sources from raw data
+                    sources = ticker_data["raw_data"]["sources"]
+
+                    # Create a list of tuples (source, data) for sorting
+                    source_items = list(sources.items())
+
+                    # Sort sources: first by having 24h change (not N/A), then by exchange name length
+                    def sort_key(source_item):
+                        source_name, source_data = source_item
+                        has_change = source_data.get("change_24h") is not None
+                        name_length = len(source_name)
+                        # Primary sort: has change (True comes first), secondary sort: name length (ascending)
+                        return (not has_change, name_length)
+
+                    # Apply sorting
+                    sorted_sources = sorted(source_items, key=sort_key)
+
+                    # Display sorted sources
+                    for source, source_data in sorted_sources:
                         price = source_data["price"]
                         change = source_data.get("change_24h")
                         change_str = (
