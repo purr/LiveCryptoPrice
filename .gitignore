@@ -1,4 +1,5 @@
 **__pycache__**
 .env
 price_history.json
-data/*
+data/markets_cache.json
+data/price_history.json

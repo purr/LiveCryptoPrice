@@ -1,0 +1,41 @@
+{
+  "Kraken": ["BNB", "NOT", "VET", "MAJOR"],
+  "Binance": ["NOT", "XMR", "MAJOR"],
+  "FX Rates": [
+    "LTC",
+    "SOL",
+    "TON",
+    "NOT",
+    "ETH",
+    "XMR",
+    "XRP",
+    "DOT",
+    "BNB",
+    "MAJOR",
+    "ADA",
+    "VET",
+    "TRX",
+    "LINK"
+  ],
+  "Huobi": ["NOT", "MAJOR"],
+  "Gate\u00e2\u20ac\u00a2io": ["NOT"],
+  "CoinGecko": [
+    "LTC",
+    "SOL",
+    "NOT",
+    "TON",
+    "ETH",
+    "XRP",
+    "DOT",
+    "XMR",
+    "BNB",
+    "MAJOR",
+    "ADA",
+    "VET",
+    "TRX",
+    "LINK"
+  ],
+  "Gate\u2022io": ["XMR"],
+  "OKX": ["VET", "XMR"],
+  "Bybit": ["VET", "XMR"]
+}
