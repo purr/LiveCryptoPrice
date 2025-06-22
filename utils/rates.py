@@ -1,7 +1,11 @@
-import os
 import json
+import os
 import time
-from typing import Any, Set, Dict, Tuple, Optional
+from typing import Any, Dict, Optional, Set, Tuple
+
+from config import CACHE_DURATION, DATA_DIR
+from utils.logger import logger
+from utils.request_manager import get_request_manager
 
 """
 Cryptocurrency Rates Module
@@ -14,10 +18,6 @@ Version: 1.4.0
 - Enhanced caching mechanism for improved performance
 - Reduced unnecessary API calls to save resources
 """
-
-from config import DATA_DIR, CACHE_DURATION
-from utils.logger import logger
-from utils.request_manager import get_request_manager
 
 # Export variables for external use
 __all__ = [
@@ -202,8 +202,22 @@ def is_pair_unsupported(exchange: str, ticker: str) -> bool:
     return exchange in unsupported_pairs and ticker in unsupported_pairs[exchange]
 
 
-def mark_pair_as_unsupported(exchange: str, ticker: str):
-    """Mark a ticker as unsupported by an exchange."""
+def mark_pair_as_unsupported(exchange: str, ticker: str, error: str = None):
+    """
+    Mark a ticker as unsupported by an exchange.
+
+    Args:
+        exchange: The exchange name
+        ticker: The ticker symbol
+        error: Optional error message that caused the marking
+    """
+    # Skip marking as unsupported if the error is rate-limit related
+    if error and ("rate limit" in error.lower() or "429" in error):
+        logger.info(
+            f"Not marking {ticker} as unsupported on {exchange} due to rate limiting"
+        )
+        return
+
     if exchange not in unsupported_pairs:
         unsupported_pairs[exchange] = set()
 
@@ -491,6 +505,9 @@ def get_binance_price(ticker):
     try:
         logger.debug(f"Fetching {ticker} price from Binance...")
 
+        # Collect error messages
+        final_error = None
+
         # Try each pair format
         for pair in pairs:
             logger.debug(f"Trying Binance pair: {pair}")
@@ -502,6 +519,7 @@ def get_binance_price(ticker):
 
             if error:
                 logger.debug(f"Binance API error for {pair}: {error}")
+                final_error = error  # Store the last error
                 continue
 
             if response and response.status_code == 200:
@@ -526,16 +544,20 @@ def get_binance_price(ticker):
             else:
                 status = response.status_code if response else "N/A"
                 logger.debug(f"Binance API returned {status} for {pair}")
+                if response and response.status_code == 429:
+                    final_error = "Rate limited"
 
         # If we've tried all formats and none worked
         logger.warning(f"Could not find valid Binance pair for {ticker}")
-        # Mark this ticker as unsupported by Binance
-        mark_pair_as_unsupported("Binance", ticker)
+
+        # Mark this ticker as unsupported by Binance, passing the error message
+        mark_pair_as_unsupported("Binance", ticker, final_error)
         return None, f"No valid pair found for {ticker} on Binance"
 
     except Exception as e:
-        logger.error(f"Exception fetching {ticker} from Binance: {e}")
-        return None, f"Exception: {str(e)}"
+        error_msg = str(e)
+        logger.error(f"Exception fetching {ticker} from Binance: {error_msg}")
+        return None, f"Exception: {error_msg}"
 
 
 # Function to get price for any ticker from Gate•io
@@ -612,6 +634,9 @@ def get_kraken_price(ticker):
             f"Fetching {ticker} price from Kraken using asset code {asset_code}"
         )
 
+        # Collect error messages
+        final_error = None
+
         # Build an array of possible pair formats to try
         pair_formats = [
             f"{asset_code}/USD",  # Modern format (BNB/USD)
@@ -635,6 +660,7 @@ def get_kraken_price(ticker):
 
             if error:
                 logger.debug(f"Kraken API error for {pair_format}: {error}")
+                final_error = error  # Store the last error
                 continue
 
             if response and response.status_code == 200:
@@ -647,49 +673,46 @@ def get_kraken_price(ticker):
                         logger.debug(
                             f"Kraken pair format {pair_format} not found, trying next"
                         )
-                        continue
-                    else:
-                        logger.warning(f"Kraken API error for {ticker}: {error_msg}")
-                        return None, error_msg
+                    continue
 
-                # If no errors, check results
+                # Find the correct key in the result
                 if "result" in data and data["result"]:
-                    # Check if this specific pair format exists in results
-                    if pair_format in data["result"]:
-                        price = float(data["result"][pair_format]["c"][0])
-                        change_24h = None  # Kraken doesn't provide 24h change directly
-                        result = {"price": price, "change_24h": change_24h}
-                        logger.info(
-                            f"Successfully fetched {ticker} price from Kraken: {price}"
-                        )
-                        return result, None
+                    # The API returns the data with the pair name as the key
+                    # Find the first key that is not "error" or "result"
+                    for key in data["result"]:
+                        # Get the current price (last trade closed price)
+                        if "c" in data["result"][key]:
+                            # First value in the array is the price
+                            price = float(data["result"][key]["c"][0])
 
-                    # If the pair doesn't match exactly, but we have results, use the first one
-                    if data["result"] and len(data["result"]) > 0:
-                        first_pair = list(data["result"].keys())[0]
-                        price = float(data["result"][first_pair]["c"][0])
-                        change_24h = None
-                        result = {"price": price, "change_24h": change_24h}
-                        logger.info(
-                            f"Successfully fetched {ticker} price from Kraken using first pair ({first_pair}): {price}"
-                        )
-                        return result, None
+                            # Try to get 24hr change
+                            change_24h = None
+                            if "p" in data["result"][key]:
+                                # Percentage change calculation
+                                # 'p' is price data with [0] being today
+                                change_24h = float(data["result"][key]["p"][1])
 
-            # If we got a non-200 response, try the next format
-            else:
-                logger.debug(
-                    f"Kraken API returned {response.status_code if response else 'N/A'} for {pair_format}"
-                )
+                            result = {"price": price, "change_24h": change_24h}
+                            logger.debug(
+                                f"Successfully fetched {ticker} price from Kraken: {price}"
+                            )
+                            return result, None
 
-        # If we've tried all formats and none worked
-        logger.warning(f"Could not find valid Kraken pair format for {ticker}")
-        # Mark this ticker as unsupported by Kraken
-        mark_pair_as_unsupported("Kraken", ticker)
-        return None, f"No valid pair format found for {ticker} on Kraken"
+            # Check for rate limiting
+            if response and response.status_code == 429:
+                final_error = "Rate limited"
+
+        # If no matching pair was found after trying all formats
+        logger.warning(f"No valid Kraken pair found for {ticker}")
+
+        # Mark this ticker as unsupported by Kraken, passing the error message
+        mark_pair_as_unsupported("Kraken", ticker, final_error)
+        return None, f"No valid pair found for {ticker} on Kraken"
 
     except Exception as e:
-        logger.error(f"Exception fetching {ticker} from Kraken: {e}")
-        return None, f"Exception: {str(e)}"
+        error_msg = str(e)
+        logger.error(f"Exception in Kraken API for {ticker}: {error_msg}")
+        return None, f"Exception: {error_msg}"
 
 
 # Function to get price for any ticker from Huobi
@@ -896,7 +919,6 @@ def get_kucoin_price(ticker):
             and stats_response
             and stats_response.status_code == 200
         ):
-
             price_data = price_response.json()
             stats_data = stats_response.json()
 
@@ -1016,7 +1038,8 @@ def get_crypto_price(ticker):
             )
         else:
             logger.warning(f"CoinGecko does not have ticker {ticker} - {error}")
-            mark_pair_as_unsupported("CoinGecko", ticker)
+            # Pass the error to mark_pair_as_unsupported
+            mark_pair_as_unsupported("CoinGecko", ticker, error)
     else:
         logger.debug(f"Skipping CoinGecko for {ticker} (known unsupported)")
         skipped_sources += 1
@@ -1038,7 +1061,8 @@ def get_crypto_price(ticker):
             )
         else:
             logger.warning(f"Gate•io does not have ticker {ticker} - {error}")
-            mark_pair_as_unsupported("Gate•io", ticker)
+            # Pass the error to mark_pair_as_unsupported
+            mark_pair_as_unsupported("Gate•io", ticker, error)
     else:
         logger.debug(f"Skipping Gate•io for {ticker} (known unsupported)")
         skipped_sources += 1
@@ -1060,7 +1084,8 @@ def get_crypto_price(ticker):
             )
         else:
             logger.warning(f"CryptoCompare does not have ticker {ticker} - {error}")
-            mark_pair_as_unsupported("CryptoCompare", ticker)
+            # Pass the error to mark_pair_as_unsupported
+            mark_pair_as_unsupported("CryptoCompare", ticker, error)
     else:
         logger.debug(f"Skipping CryptoCompare for {ticker} (known unsupported)")
         skipped_sources += 1
@@ -1126,7 +1151,8 @@ def get_crypto_price(ticker):
             )
         else:
             logger.warning(f"Huobi does not have ticker {ticker} - {error}")
-            mark_pair_as_unsupported("Huobi", ticker)
+            # Pass the error to mark_pair_as_unsupported
+            mark_pair_as_unsupported("Huobi", ticker, error)
     else:
         logger.debug(f"Skipping Huobi for {ticker} (known unsupported)")
         skipped_sources += 1
@@ -1148,7 +1174,8 @@ def get_crypto_price(ticker):
             )
         else:
             logger.warning(f"OKX does not have ticker {ticker} - {error}")
-            mark_pair_as_unsupported("OKX", ticker)
+            # Pass the error to mark_pair_as_unsupported
+            mark_pair_as_unsupported("OKX", ticker, error)
     else:
         logger.debug(f"Skipping OKX for {ticker} (known unsupported)")
         skipped_sources += 1
@@ -1170,7 +1197,8 @@ def get_crypto_price(ticker):
             )
         else:
             logger.warning(f"KuCoin does not have ticker {ticker} - {error}")
-            mark_pair_as_unsupported("KuCoin", ticker)
+            # Pass the error to mark_pair_as_unsupported
+            mark_pair_as_unsupported("KuCoin", ticker, error)
     else:
         logger.debug(f"Skipping KuCoin for {ticker} (known unsupported)")
         skipped_sources += 1
@@ -1192,12 +1220,13 @@ def get_crypto_price(ticker):
             )
         else:
             logger.warning(f"Bybit does not have ticker {ticker} - {error}")
-            mark_pair_as_unsupported("Bybit", ticker)
+            # Pass the error to mark_pair_as_unsupported
+            mark_pair_as_unsupported("Bybit", ticker, error)
     else:
         logger.debug(f"Skipping Bybit for {ticker} (known unsupported)")
         skipped_sources += 1
 
-    # FX Rates API (new)
+    # FX Rates (new) - forex and some crypto rates
     if not is_pair_unsupported("FX Rates", ticker):
         result, error = get_fxratesapi_price(ticker)
         if result is not None:
@@ -1213,10 +1242,11 @@ def get_crypto_price(ticker):
                 f"FX Rates: {format_price(result['price'])} ({format_percent_change(result['change_24h'])})"
             )
         else:
-            logger.warning(f"FX Rates API does not have ticker {ticker} - {error}")
-            mark_pair_as_unsupported("FX Rates", ticker)
+            logger.warning(f"FX Rates does not have ticker {ticker} - {error}")
+            # Pass the error to mark_pair_as_unsupported
+            mark_pair_as_unsupported("FX Rates", ticker, error)
     else:
-        logger.debug(f"Skipping FX Rates API for {ticker} (known unsupported)")
+        logger.debug(f"Skipping FX Rates for {ticker} (known unsupported)")
         skipped_sources += 1
 
     # Calculate and return average price and average 24h change
