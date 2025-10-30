@@ -1,8 +1,8 @@
-import os
-import json
-import time
 import asyncio
+import json
+import os
 import pathlib
+import time
 from typing import Any, Dict, List, Optional
 
 """
@@ -17,25 +17,25 @@ Version: 1.3.0
 - Enhanced cache usage for better performance
 """
 
-from dotenv import load_dotenv
 from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import (
     TelegramAPIError,
-    TelegramRetryAfter,
     TelegramForbiddenError,
+    TelegramRetryAfter,
 )
-from aiogram.client.default import DefaultBotProperties
+from dotenv import load_dotenv
 
 from config import (
-    SORTING,
     CHANNELS,
     RETRY_INTERVAL,
-    UPDATE_INTERVAL,
     SHOW_INDIVIDUAL_SOURCES,
+    SORTING,
+    UPDATE_INTERVAL,
 )
-from utils.rates import format_price, get_cached_price, get_crypto_price
 from utils.logger import logger
+from utils.rates import format_price, get_cached_price, get_crypto_price
 
 # Data directory setup
 DATA_DIR = "data"
@@ -166,6 +166,11 @@ async def process_ticker_data(ticker: str) -> Optional[Dict[str, Any]]:
         # Get current price
         current_price = data["average_price"]
 
+        # Skip if price is zero or invalid
+        if current_price is None or current_price <= 0:
+            logger.warning(f"Invalid price for {ticker}: {current_price}")
+            return None
+
         # Get 24h change percentage and format it
         change_24h = data.get("average_change_24h")
         change_24h_str = (
@@ -272,7 +277,7 @@ async def send_update_to_channel(channel_id: str, tickers: List[str]) -> bool:
             # For single ticker, create detailed message
             ticker = tickers[0]
             ticker_data = await process_ticker_data(ticker)
-            if ticker_data:
+            if ticker_data and ticker_data.get("price", 0) > 0:
                 message_parts = []
                 # Get price change indicator based on last recorded price
                 price_indicator = ticker_data["price_indicator"]
@@ -341,7 +346,11 @@ async def send_update_to_channel(channel_id: str, tickers: List[str]) -> bool:
             # Small delay to avoid hitting rate limits
             await asyncio.sleep(0.5)
             return True
-        return False
+        else:
+            logger.warning(
+                f"No valid message to send to {channel_id} (all prices may be zero or invalid)"
+            )
+            return False
     except TelegramRetryAfter as e:
         logger.warning(f"Rate limited. Retry after {e.retry_after}s")
         await asyncio.sleep(e.retry_after)

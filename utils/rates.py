@@ -127,9 +127,21 @@ def load_unsupported_pairs():
                 unsupported_pairs = {
                     exchange: set(tickers) for exchange, tickers in data.items()
                 }
+
+            # Calculate totals for logging
+            total_pairs = sum(len(pairs) for pairs in unsupported_pairs.values())
+            total_exchanges = len(unsupported_pairs)
+
+            # Count tickers per exchange for detailed logging
+            exchange_counts = {
+                exchange: len(tickers)
+                for exchange, tickers in unsupported_pairs.items()
+            }
+
             logger.info(
-                f"Loaded unsupported pairs from file: {sum(len(pairs) for pairs in unsupported_pairs.values())} pairs"
+                f"Loaded ticker blacklist: {total_pairs} entries for {len(exchange_counts)} tickers across {total_exchanges} exchanges"
             )
+
         except Exception as e:
             logger.error(f"Error loading unsupported pairs: {e}")
             unsupported_pairs = {}
@@ -150,6 +162,8 @@ def initialize_manual_blacklist():
     - Added initial implementation
     - Blacklisted Monero (XMR) on Binance
     """
+    logger.debug("Blacklist initialized")
+
     # Cryptocurrencies to blacklist on specific exchanges
     manual_blacklist = {
         "Binance": ["XMR"],  # Monero is blacklisted on Binance
@@ -161,6 +175,8 @@ def initialize_manual_blacklist():
             if not is_pair_unsupported(exchange, ticker):
                 mark_pair_as_unsupported(exchange, ticker)
                 logger.info(f"Manually blacklisted {ticker} on {exchange}")
+            else:
+                logger.debug(f"{ticker} already blacklisted on {exchange}")
 
 
 # Last save timestamp to avoid excessive disk I/O
@@ -212,11 +228,29 @@ def mark_pair_as_unsupported(exchange: str, ticker: str, error: str = None):
         error: Optional error message that caused the marking
     """
     # Skip marking as unsupported if the error is rate-limit related
-    if error and ("rate limit" in error.lower() or "429" in error):
-        logger.info(
-            f"Not marking {ticker} as unsupported on {exchange} due to rate limiting"
-        )
-        return
+    if error:
+        # More comprehensive check for rate limit related errors
+        rate_limit_indicators = [
+            "rate limit",
+            "429",
+            "too many requests",
+            "ratelimit",
+            "rate-limit",
+            "too fast",
+            "slow down",
+            "timeout",
+            "try again later",
+            "request limit",
+            "api limit",
+            "exceeded",
+            "throttle",
+        ]
+        for indicator in rate_limit_indicators:
+            if indicator in error.lower():
+                logger.info(
+                    f"Not marking {ticker} as unsupported on {exchange} due to rate limiting ({indicator})"
+                )
+                return
 
     if exchange not in unsupported_pairs:
         unsupported_pairs[exchange] = set()
@@ -374,31 +408,7 @@ def coingecko_rates():
         return {}
 
 
-# CryptoCompare API - Free public API
-def cryptocompare_rates():
-    try:
-        logger.debug("Fetching BTC price from CryptoCompare")
-        response, error = request_manager.get(
-            "https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD"
-        )
-
-        if error:
-            logger.warning(f"CryptoCompare API error: {error}")
-            return {}
-
-        if response and response.status_code == 200:
-            data = response.json()
-            # Format as rates with BTC as the key for consistency
-            rates = {"BTC": data["USD"]}  # Direct price, not inverted
-            logger.debug(f"CryptoCompare BTC: {rates['BTC']}")
-            return rates
-        else:
-            status_code = response.status_code if response else "N/A"
-            logger.warning(f"CryptoCompare API error: {status_code}")
-            return {}
-    except Exception as e:
-        logger.error(f"CryptoCompare error: {e}")
-        return {}
+# CryptoCompare API - Removed (requires API key)
 
 
 # Function to get price for any ticker from CoinGecko
@@ -457,37 +467,7 @@ def get_coingecko_price(ticker):
         return None, f"Exception: {str(e)}"
 
 
-# Function to get price for any ticker from CryptoCompare
-def get_cryptocompare_price(ticker):
-    ticker = ticker.upper()
-
-    try:
-        # Updated to include 24h change
-        response, error = request_manager.get(
-            f"https://min-api.cryptocompare.com/data/pricemultifull?fsyms={ticker}&tsyms=USD"
-        )
-
-        if error:
-            return None, f"API error: {error}"
-
-        if response and response.status_code == 200:
-            data = response.json()
-            if "RAW" in data and ticker in data["RAW"] and "USD" in data["RAW"][ticker]:
-                raw_data = data["RAW"][ticker]["USD"]
-                price = raw_data["PRICE"]
-                # Get 24h change percentage
-                change_24h = raw_data.get("CHANGEPCT24HOUR", None)
-                result = {"price": price, "change_24h": change_24h}
-                return result, None
-            elif "Message" in data:
-                return None, data["Message"]
-            return None, "Price not found in response"
-        return (
-            None,
-            f"Error {response.status_code if response else 'N/A'}: {response.text if response else 'No response'}",
-        )
-    except Exception as e:
-        return None, f"Exception: {str(e)}"
+# CryptoCompare price function removed (requires API key)
 
 
 # Function to get price for any ticker from Binance
@@ -517,8 +497,14 @@ def get_binance_price(ticker):
                 f"https://api.binance.com/api/v3/ticker/24hr?symbol={pair}"
             )
 
+            # Explicitly handle rate limiting errors
             if error:
                 logger.debug(f"Binance API error for {pair}: {error}")
+                if any(
+                    term in error.lower()
+                    for term in ["rate limit", "429", "too many request"]
+                ):
+                    return None, f"Rate limited: {error}"
                 final_error = error  # Store the last error
                 continue
 
@@ -540,18 +526,35 @@ def get_binance_price(ticker):
                     )
                     return result, None
 
+            # Explicitly check for rate limit status code
+            elif response and response.status_code == 429:
+                logger.warning(f"Rate limit reached for Binance API with {pair}")
+                return None, "Rate limited: 429 Too Many Requests"
             # If we got a non-200 response or missing data, try next format
             else:
                 status = response.status_code if response else "N/A"
                 logger.debug(f"Binance API returned {status} for {pair}")
-                if response and response.status_code == 429:
-                    final_error = "Rate limited"
+                if response and hasattr(response, "text"):
+                    # Check response text for rate limit indicators
+                    if any(
+                        term in response.text.lower()
+                        for term in ["rate limit", "too many request", "throttle"]
+                    ):
+                        return None, f"Rate limited: {response.text}"
 
         # If we've tried all formats and none worked
         logger.warning(f"Could not find valid Binance pair for {ticker}")
 
-        # Mark this ticker as unsupported by Binance, passing the error message
-        mark_pair_as_unsupported("Binance", ticker, final_error)
+        # Only mark as unsupported if it's not a rate limit issue
+        if not (
+            final_error
+            and any(
+                term in final_error.lower()
+                for term in ["rate limit", "429", "too many request"]
+            )
+        ):
+            mark_pair_as_unsupported("Binance", ticker, final_error)
+
         return None, f"No valid pair found for {ticker} on Binance"
 
     except Exception as e:
@@ -902,16 +905,50 @@ def get_kucoin_price(ticker):
             f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={ticker}-USDT"
         )
 
+        # Check for rate limit errors in the price request
         if price_error:
+            # Check if it's a rate limit error
+            if any(
+                term in price_error.lower()
+                for term in ["rate limit", "429", "too many request", "too fast"]
+            ):
+                logger.warning(
+                    f"Rate limit reached for KuCoin API price request: {price_error}"
+                )
+                return None, f"Rate limited: {price_error}"
             return None, f"API error (price): {price_error}"
+
+        # Check for rate limit response code
+        if price_response and price_response.status_code == 429:
+            logger.warning(
+                "Rate limit reached for KuCoin API price request (status code 429)"
+            )
+            return None, "Rate limited: 429 Too Many Requests"
 
         # Get 24h stats
         stats_response, stats_error = request_manager.get(
             f"https://api.kucoin.com/api/v1/market/stats?symbol={ticker}-USDT"
         )
 
+        # Check for rate limit errors in the stats request
         if stats_error:
+            # Check if it's a rate limit error
+            if any(
+                term in stats_error.lower()
+                for term in ["rate limit", "429", "too many request", "too fast"]
+            ):
+                logger.warning(
+                    f"Rate limit reached for KuCoin API stats request: {stats_error}"
+                )
+                return None, f"Rate limited: {stats_error}"
             return None, f"API error (stats): {stats_error}"
+
+        # Check for rate limit response code
+        if stats_response and stats_response.status_code == 429:
+            logger.warning(
+                "Rate limit reached for KuCoin API stats request (status code 429)"
+            )
+            return None, "Rate limited: 429 Too Many Requests"
 
         if (
             price_response
@@ -921,6 +958,19 @@ def get_kucoin_price(ticker):
         ):
             price_data = price_response.json()
             stats_data = stats_response.json()
+
+            # Check for rate limit messages in response
+            for data in [price_data, stats_data]:
+                if "msg" in data and data["msg"]:
+                    msg = data["msg"].lower()
+                    if any(
+                        term in msg
+                        for term in ["rate limit", "too many request", "too fast"]
+                    ):
+                        logger.warning(
+                            f"Rate limit indicated in KuCoin response: {data['msg']}"
+                        )
+                        return None, f"Rate limited: {data['msg']}"
 
             if price_data.get("code") == "200000" and "data" in price_data:
                 price_info = price_data["data"]
@@ -947,7 +997,9 @@ def get_kucoin_price(ticker):
         status_codes = f"{price_response.status_code if price_response else 'N/A'}/{stats_response.status_code if stats_response else 'N/A'}"
         return None, f"Error {status_codes}"
     except Exception as e:
-        return None, f"Exception: {str(e)}"
+        error_msg = str(e)
+        logger.error(f"Exception fetching {ticker} from KuCoin: {error_msg}")
+        return None, f"Exception: {error_msg}"
 
 
 # Function to get price for any ticker from Bybit
@@ -1067,28 +1119,7 @@ def get_crypto_price(ticker):
         logger.debug(f"Skipping Gate•io for {ticker} (known unsupported)")
         skipped_sources += 1
 
-    # CryptoCompare
-    if not is_pair_unsupported("CryptoCompare", ticker):
-        result, error = get_cryptocompare_price(ticker)
-        if result is not None:
-            prices.append(result["price"])
-            if result["change_24h"] is not None:
-                change_24h_values.append(result["change_24h"])
-            active_sources += 1
-            source_data["CryptoCompare"] = {
-                "price": result["price"],
-                "change_24h": result["change_24h"],
-            }
-            logger.debug(
-                f"CryptoCompare: {format_price(result['price'])} ({format_percent_change(result['change_24h'])})"
-            )
-        else:
-            logger.warning(f"CryptoCompare does not have ticker {ticker} - {error}")
-            # Pass the error to mark_pair_as_unsupported
-            mark_pair_as_unsupported("CryptoCompare", ticker, error)
-    else:
-        logger.debug(f"Skipping CryptoCompare for {ticker} (known unsupported)")
-        skipped_sources += 1
+    # CryptoCompare - Removed (requires API key)
 
     # Binance
     if not is_pair_unsupported("Binance", ticker):

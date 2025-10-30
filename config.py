@@ -44,6 +44,7 @@ SHOW_INDIVIDUAL_SOURCES = True
 RETRY_INTERVAL = 60  # seconds
 TIMEOUT = 10  # seconds
 CACHE_DURATION = 60  # seconds
+MAX_PROXY_RETRIES = 3  # maximum number of proxy retries
 
 # Sorting configuration
 SORTING = {
